@@ -27,8 +27,8 @@ RUN wget -q -O /tmp/musescore.appimage \
     && mkdir -p /opt/musescore \
     && cd /opt/musescore \
     && /tmp/musescore.appimage --appimage-extract >/dev/null \
-    && mv squashfs-root/* . \
-    && rmdir squashfs-root \
+    && cp -a squashfs-root/. . \
+    && rm -rf squashfs-root \
     && rm /tmp/musescore.appimage \
     && ln -s /opt/musescore/bin/mscore4portable /usr/local/bin/mscore
 
