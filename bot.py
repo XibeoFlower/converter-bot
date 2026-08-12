@@ -34,6 +34,7 @@ FORMAT_LABELS = {
     "mp3": "MP3 (audio)",
     "ogg": "OGG (audio)",
     "flac": "FLAC (audio)",
+    "roblox": "QWERTY Sheet (Roblox Piano)",
 }
 
 # Discord's *default* per-file upload cap; boosted servers get more.
@@ -70,7 +71,7 @@ class FormatSelect(discord.ui.Select):
                 results = await convert_many(midi_path, formats, work_dir)
             except Exception as e:
                 log.exception("Conversion crashed")
-                await interaction.followup.send(f"❌ Lỗi khi chuyển đổi: {e}")
+                await interaction.followup.send(f"{interaction.user.mention} ❌ Lỗi khi chuyển đổi: {e}")
                 return
 
             errors = results.pop("__errors__", None)
@@ -90,9 +91,13 @@ class FormatSelect(discord.ui.Select):
             for name, data in files_to_send:
                 attachments.append(discord.File(io.BytesIO(data), filename=name))
 
+            mention = interaction.user.mention
+
             msg_parts = []
             if attachments:
-                msg_parts.append(f"✅ Đã chuyển đổi **{len(attachments)}** file.")
+                msg_parts.append(f"{mention} ✅ Đã chuyển đổi **{len(attachments)}** file.")
+            else:
+                msg_parts.append(f"{mention} ❌ Không có file nào được tạo.")
             if errors:
                 failed = ", ".join(f"{f} ({err.splitlines()[0][:100]})" for f, err in errors.items())
                 msg_parts.append(f"⚠️ Không chuyển được: {failed}")
@@ -103,7 +108,7 @@ class FormatSelect(discord.ui.Select):
                 )
 
             if not attachments:
-                await interaction.followup.send("\n".join(msg_parts) or "❌ Không có file nào được tạo.")
+                await interaction.followup.send("\n".join(msg_parts))
                 return
 
             # Discord caps at 10 attachments per message.
