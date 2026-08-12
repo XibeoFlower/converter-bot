@@ -4,26 +4,42 @@ Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC
 Strategy:
   - MuseScore (headless, via xvfb-run) handles anything that needs music
     notation rendering: PDF, PNG, MusicXML, MSCZ, and WAV (raw audio render).
-  - ffmpeg converts the WAV render into MP3 / OGG / FLAC, which sidesteps
-    MuseScore 4's separate (license-gated) MP3 encoder download.
+  - Before notation formats (PDF/PNG/MusicXML/MSCZ), we quantize a *copy* of
+    the input MIDI to a 16th-note grid. Raw/human-performed MIDI has timing
+    that doesn't line up to any clean rhythmic grid, so MuseScore's importer
+    (which reads at tick-level precision) transcribes it as a mess of tiny,
+    fragmented note values. Quantizing first gives MuseScore clean rhythms to
+    work with. Audio and MIDI-passthrough outputs use the *original*,
+    unquantized file so the actual performance timing/feel is preserved.
+  - ffmpeg converts the WAV render into MP3 / OGG / FLAC. We apply loudness
+    normalization + a peak limiter here, because MuseScore's internal mixer
+    can sum overlapping notes above 0 dBFS and hard-clip (audible
+    distortion/crackle) on dense scores.
   - MIDI output is just the original file, copied through unchanged.
 """
 
 import asyncio
+import logging
 import shutil
 from pathlib import Path
+
+import mido
 
 MSCORE_BIN = "mscore"  # symlinked in the Docker image
 
 # Formats MuseScore itself can export to directly from a single command.
 _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
+# Notation formats that benefit from quantizing the MIDI first.
+_NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
 # Formats produced by re-encoding the WAV render with ffmpeg.
 _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
 
 SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | {"midi"}
 
-
-import logging
+# Audio filter: loudnorm brings overall level to a safe target *before* any
+# clipping happens, alimiter catches remaining peaks. This fixes crackle/
+# distortion that comes from MuseScore's internal mix exceeding 0 dBFS.
+_ANTI_CLIP_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.95"
 
 log = logging.getLogger("converter")
 
@@ -61,6 +77,56 @@ async def _run(cmd: list[str], cwd: Path, timeout: int = 120) -> None:
         )
 
 
+def _quantize_midi(src: Path, dst: Path, subdivision: int = 16) -> None:
+    """Snap all event times onto a `subdivision`-note grid (default: 16th notes).
+
+    This does not change note pitches, velocities, or instruments — only
+    when each event lands in time — so the audible performance character is
+    unaffected when this file is only used for notation rendering.
+    """
+    mid = mido.MidiFile(str(src))
+    ticks_per_beat = mid.ticks_per_beat
+    # ticks per grid unit: a quarter note = ticks_per_beat, so a 1/16 note
+    # is ticks_per_beat / 4, generalized as ticks_per_beat * 4 / subdivision.
+    grid = max(1, round(ticks_per_beat * 4 / subdivision))
+
+    for track in mid.tracks:
+        abs_time = 0
+        timed_events = []
+        for msg in track:
+            abs_time += msg.time
+            timed_events.append([abs_time, msg])
+
+        for pair in timed_events:
+            pair[0] = round(pair[0] / grid) * grid
+
+        # Stable sort: preserves original relative order for same-tick events
+        # (e.g. note_off before note_on of a different note at the same tick).
+        timed_events.sort(key=lambda pair: pair[0])
+
+        new_track = mido.MidiTrack()
+        prev_time = 0
+        for q_time, msg in timed_events:
+            delta = max(0, q_time - prev_time)
+            new_track.append(msg.copy(time=delta))
+            prev_time = q_time
+        track.clear()
+        track.extend(new_track)
+
+    mid.save(str(dst))
+
+
+async def _get_quantized_midi(input_midi: Path, work_dir: Path) -> Path:
+    quantized_path = work_dir / f"{input_midi.stem}.quantized.mid"
+    if not quantized_path.exists():
+        try:
+            await asyncio.to_thread(_quantize_midi, input_midi, quantized_path)
+        except Exception as e:
+            log.warning("Quantization failed (%s), falling back to original MIDI", e)
+            shutil.copy(input_midi, quantized_path)
+    return quantized_path
+
+
 async def _mscore_export(input_midi: Path, out_path: Path, work_dir: Path) -> None:
     cmd = [
         "xvfb-run", "-a",
@@ -84,26 +150,41 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
         shutil.copy(input_midi, out_path)
         return out_path
 
-    if fmt in _MSCORE_NATIVE:
-        out_path = work_dir / f"{stem}.{fmt if fmt != 'musicxml' else 'musicxml'}"
-        await _mscore_export(input_midi, out_path, work_dir)
+    if fmt in _NOTATION_FORMATS:
+        source = await _get_quantized_midi(input_midi, work_dir)
+        out_path = work_dir / f"{stem}.{fmt}"
+        await _mscore_export(source, out_path, work_dir)
         if not out_path.exists():
             raise ConversionError(f"MuseScore did not produce {out_path.name}")
         return out_path
 
+    if fmt == "wav":
+        out_path = work_dir / f"{stem}.wav"
+        raw_wav = work_dir / f"{stem}.raw.wav"
+        if not raw_wav.exists():
+            await _mscore_export(input_midi, raw_wav, work_dir)
+            if not raw_wav.exists():
+                raise ConversionError("MuseScore failed to render audio (WAV)")
+        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER, str(out_path)]
+        await _run(cmd, cwd=work_dir)
+        if not out_path.exists():
+            raise ConversionError("ffmpeg did not produce anti-clip WAV")
+        return out_path
+
     if fmt in _FFMPEG_DERIVED:
-        # Render WAV first (cached per work_dir), then re-encode.
-        wav_path = work_dir / f"{stem}.wav"
-        if not wav_path.exists():
-            await _mscore_export(input_midi, wav_path, work_dir)
-            if not wav_path.exists():
+        # Render raw WAV first (cached per work_dir), then re-encode with the
+        # anti-clip filter applied.
+        raw_wav = work_dir / f"{stem}.raw.wav"
+        if not raw_wav.exists():
+            await _mscore_export(input_midi, raw_wav, work_dir)
+            if not raw_wav.exists():
                 raise ConversionError("MuseScore failed to render audio (WAV) for encoding")
 
         out_path = work_dir / f"{stem}.{fmt}"
         codec = {"mp3": ["-codec:a", "libmp3lame", "-qscale:a", "2"],
                  "ogg": ["-codec:a", "libvorbis", "-qscale:a", "5"],
                  "flac": ["-codec:a", "flac"]}[fmt]
-        cmd = ["ffmpeg", "-y", "-i", str(wav_path), *codec, str(out_path)]
+        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER, *codec, str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
             raise ConversionError(f"ffmpeg did not produce {out_path.name}")
