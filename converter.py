@@ -23,6 +23,11 @@ _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
 SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | {"midi"}
 
 
+import logging
+
+log = logging.getLogger("converter")
+
+
 class ConversionError(RuntimeError):
     pass
 
@@ -40,9 +45,19 @@ async def _run(cmd: list[str], cwd: Path, timeout: int = 120) -> None:
         proc.kill()
         raise ConversionError(f"Timed out running: {' '.join(cmd)}")
 
+    # Always log the full output server-side — the message we raise for Discord
+    # is truncated, but Railway logs should have everything for debugging.
+    log.info(
+        "cmd=%s returncode=%s\n--- stdout ---\n%s\n--- stderr ---\n%s",
+        " ".join(cmd), proc.returncode,
+        stdout.decode(errors="ignore"),
+        stderr.decode(errors="ignore"),
+    )
+
     if proc.returncode != 0:
+        combined = (stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")).strip()
         raise ConversionError(
-            f"Command failed ({' '.join(cmd)}):\n{stderr.decode(errors='ignore')[-1500:]}"
+            f"Command failed ({' '.join(cmd)}), exit {proc.returncode}:\n{combined[-1500:] or '(no output)'}"
         )
 
 
