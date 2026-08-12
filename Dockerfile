@@ -1,23 +1,30 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    QT_QPA_PLATFORM=offscreen \
     MSCORE_BIN=/opt/musescore/bin/mscore4portable
 
-# --- System deps ---------------------------------------------------------
+# --- System deps -----------------------------------------------------------
+# We install the `musescore` apt package purely to pull in its full runtime
+# dependency graph (OpenGL, audio, X11, font libs, etc. — MuseScore 4's
+# AppImage is picky and under-documents what it actually needs). We then
+# remove just the `musescore` binary package afterwards and run the newer
+# MuseScore 4 AppImage instead, keeping all the transitively-installed libs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         wget \
         ca-certificates \
-        libopengl0 \
+        musescore \
         libnss3 \
         libxkbcommon0 \
+        libegl1 \
+        libopengl0 \
         libgl1 \
         fontconfig \
         fonts-freefont-ttf \
         ffmpeg \
         python3 \
         python3-pip \
+    && apt-get remove -y musescore \
     && rm -rf /var/lib/apt/lists/*
 
 # --- MuseScore 4 (AppImage, extracted so it runs without FUSE) ----------
