@@ -2,7 +2,7 @@
 
 Bot Discord với lệnh `/converter` — người dùng tải lên một file **MIDI của họ**
 và chọn các định dạng muốn xuất: PDF, PNG, MP3, WAV, FLAC, OGG, MIDI,
-MusicXML, MSCZ.
+MusicXML, MSCZ, và **QWERTY Sheet (Roblox Piano)**.
 
 > Bot này chỉ xử lý file MIDI mà người dùng tự upload — nó **không** tải hay
 > bẻ khóa nội dung có bản quyền từ MuseScore.com hay bất kỳ nguồn nào khác.
@@ -14,6 +14,21 @@ MusicXML, MSCZ.
 2. `ffmpeg` mã hoá lại file WAV đó sang MP3 / OGG / FLAC (tránh vướng vấn đề
    bản quyền của bộ mã hoá MP3 tích hợp trong MuseScore 4).
 3. MIDI output = file gốc, copy nguyên vẹn.
+4. QWERTY Sheet (Roblox Piano): map từng nốt vào bàn phím ảo chuẩn
+   virtualpiano.net/Roblox Piano (`1234567890 qwertyuiop asdfghjkl zxcvbnm`,
+   phủ từ C2 đến C7). Nốt thăng/giáng bị làm tròn về phím tự nhiên gần nhất
+   (layout này chỉ có phím trắng). Nhiều nốt cùng lúc gộp thành hợp âm
+   `[abc]`. Xuất ra file `.txt`.
+
+## Thông báo khi xong
+
+Sau khi convert xong, bot mention (`@user`) người đã chạy lệnh trong tin
+nhắn kết quả. Lưu ý: tin nhắn kết quả hiện đang là **ephemeral** (chỉ người
+chạy lệnh thấy), nên mention chủ yếu có tác dụng làm nổi bật trong chính
+tin nhắn đó chứ không tạo thông báo kiểu "bị tag ở kênh khác". Nếu muốn bot
+tag công khai trong kênh (để người khác cũng thấy, hoặc để có thông báo
+ngay cả khi không đang mở Discord), đổi `ephemeral=True` → `False` ở lệnh
+`/converter` trong `bot.py`.
 
 ## Chạy thử local
 
