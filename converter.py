@@ -2,8 +2,15 @@
 Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet
 
 Strategy:
-  - MuseScore (headless, via xvfb-run) handles anything that needs music
-    notation rendering: PDF, PNG, MusicXML, MSCZ, and WAV (raw audio render).
+  - MuseScore (headless, via xvfb-run) handles only notation rendering now:
+    PDF, PNG, MusicXML, MSCZ.
+  - Audio (WAV / MP3 / OGG / FLAC) is rendered with FluidSynth instead of
+    MuseScore's own WAV export. MuseScore's headless audio export (running
+    under xvfb, no real soundcard) periodically drops or duplicates audio
+    blocks, which is heard as skipping/stuttering ("audio bị nhảy"). FluidSynth
+    renders MIDI to WAV in one non-realtime pass (no live audio device, no
+    frame drops), which is the same approach most MIDI-to-MP3 web converters
+    use, and produces smooth, glitch-free output.
   - Before notation formats (PDF/PNG/MusicXML/MSCZ) and the Roblox/QWERTY
     text sheet, we quantize a *copy* of the input MIDI to a 16th-note grid.
     Raw/human-performed MIDI has timing that doesn't line up to any clean
@@ -12,9 +19,9 @@ Strategy:
     with. Audio and MIDI-passthrough outputs use the *original*, unquantized
     file so the actual performance timing/feel is preserved.
   - ffmpeg converts the WAV render into MP3 / OGG / FLAC. We apply loudness
-    normalization + a peak limiter here, because MuseScore's internal mixer
-    can sum overlapping notes above 0 dBFS and hard-clip (audible
-    distortion/crackle) on dense scores.
+    normalization + a peak limiter here, because summing overlapping notes
+    can exceed 0 dBFS and hard-clip (audible distortion/crackle) on dense
+    scores.
   - MIDI output is just the original file, copied through unchanged.
   - The Roblox/QWERTY sheet maps each note to a letter on the standard
     virtual-piano keyboard layout (1234567890 / qwertyuiop / asdfghjkl /
@@ -25,12 +32,19 @@ Strategy:
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 
 import mido
 
 MSCORE_BIN = "mscore"  # symlinked in the Docker image
+FLUIDSYNTH_BIN = "fluidsynth"
+# General MIDI soundfont installed via the `fluid-soundfont-gm` apt package
+# (see Dockerfile). Overridable in case a different soundfont is mounted.
+SOUNDFONT_PATH = os.environ.get(
+    "SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+)
 
 # Formats MuseScore itself can export to directly from a single command.
 _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
@@ -230,6 +244,27 @@ async def _mscore_export(input_midi: Path, out_path: Path, work_dir: Path) -> No
     await _run(cmd, cwd=work_dir)
 
 
+async def _fluidsynth_render(input_midi: Path, out_path: Path, work_dir: Path) -> None:
+    """Render MIDI to WAV with FluidSynth in one non-realtime pass.
+
+    Unlike MuseScore's headless (xvfb) audio export, this doesn't render
+    against a live audio device/clock, so there's nothing for the process to
+    fall behind on — no dropped or duplicated audio blocks, i.e. no
+    skipping/stuttering ("nhảy") in the resulting audio. This mirrors how
+    most MIDI-to-MP3 web converters render audio.
+    """
+    cmd = [
+        FLUIDSYNTH_BIN,
+        "-ni",                  # no interactive shell, no MIDI input device
+        "-g", "1.0",            # synth gain
+        "-r", "44100",          # sample rate
+        "-F", str(out_path),    # render straight to a WAV file (non-realtime)
+        SOUNDFONT_PATH,
+        str(input_midi),
+    ]
+    await _run(cmd, cwd=work_dir, timeout=180)
+
+
 async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
     """Convert input_midi to `fmt`, returning the path to the produced file."""
     fmt = fmt.lower()
@@ -258,9 +293,9 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
         out_path = work_dir / f"{stem}.wav"
         raw_wav = work_dir / f"{stem}.raw.wav"
         if not raw_wav.exists():
-            await _mscore_export(input_midi, raw_wav, work_dir)
+            await _fluidsynth_render(input_midi, raw_wav, work_dir)
             if not raw_wav.exists():
-                raise ConversionError("MuseScore failed to render audio (WAV)")
+                raise ConversionError("FluidSynth failed to render audio (WAV)")
         cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER, str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
@@ -272,9 +307,9 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
         # anti-clip filter applied.
         raw_wav = work_dir / f"{stem}.raw.wav"
         if not raw_wav.exists():
-            await _mscore_export(input_midi, raw_wav, work_dir)
+            await _fluidsynth_render(input_midi, raw_wav, work_dir)
             if not raw_wav.exists():
-                raise ConversionError("MuseScore failed to render audio (WAV) for encoding")
+                raise ConversionError("FluidSynth failed to render audio (WAV) for encoding")
 
         out_path = work_dir / f"{stem}.{fmt}"
         codec = {"mp3": ["-codec:a", "libmp3lame", "-qscale:a", "2"],
