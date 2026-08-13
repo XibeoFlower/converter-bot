@@ -9,6 +9,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # AppImage is picky and under-documents what it actually needs). We then
 # remove just the `musescore` binary package afterwards and run the newer
 # MuseScore 4 AppImage instead, keeping all the transitively-installed libs.
+# fluidsynth + fluid-soundfont-gm render the audio outputs (WAV/MP3/OGG/FLAC)
+# in one non-realtime pass, instead of MuseScore's headless WAV export —
+# that path intermittently drops/duplicates audio blocks under xvfb (heard as
+# skipping/stuttering). MuseScore is kept only for notation exports
+# (PDF/PNG/MusicXML/MSCZ).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         wget \
@@ -22,6 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fontconfig \
         fonts-freefont-ttf \
         ffmpeg \
+        fluidsynth \
+        fluid-soundfont-gm \
         python3 \
         python3-pip \
     && apt-get remove -y musescore \
