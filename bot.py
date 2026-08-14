@@ -35,6 +35,7 @@ FORMAT_LABELS = {
     "ogg": "OGG (audio)",
     "flac": "FLAC (audio)",
     "roblox": "QWERTY Sheet (Roblox Piano)",
+    "guitar": "Guitar Tab (TAB)",
 }
 
 # Discord's *default* per-file upload cap; boosted servers get more.
@@ -135,7 +136,7 @@ async def on_ready():
     log.info("Logged in as %s", bot.user)
 
 
-@bot.tree.command(name="converter", description="Chuyển đổi file MIDI sang PDF/PNG/MP3/WAV/FLAC/OGG/MusicXML/MSCZ")
+@bot.tree.command(name="converter", description="Chuyển đổi file MIDI sang PDF/PNG/MP3/WAV/FLAC/OGG/MusicXML/MSCZ/Guitar Tab")
 @app_commands.describe(file="File MIDI cần chuyển đổi (.mid / .midi)")
 async def converter(interaction: discord.Interaction, file: discord.Attachment):
     if not file.filename.lower().endswith((".mid", ".midi")):
