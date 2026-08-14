@@ -1,5 +1,5 @@
 """
-Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3) / Violin Audio (MP3)
+Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3) / Violin Audio (MP3) / Piano Audio (MP3)
 
 Strategy:
   - MuseScore (headless, via xvfb-run) handles only notation rendering now:
@@ -35,16 +35,28 @@ Strategy:
     range are octave-shifted to fit, and chords with more notes than
     playable strings have the excess dropped — this is a best-effort tab,
     not a full fingering/voicing solver.
-  - Guitar Audio (MP3) and Violin Audio (MP3) render the piece with
-    FluidSynth like the other audio formats, but first rewrite a *copy* of
-    the MIDI so every note plays on a single instrument (Acoustic Guitar
-    (steel), or Violin) instead of whatever the original file specifies,
-    and drop the GM drum channel (neither instrument can play a drum kit).
-    Violin also gets gentler per-note velocities and a FluidSynth reverb
-    tuned down (small room, low level, chorus off) so it stays moderate and
-    not "vang" (echoey) — a soft, close-mic'd solo-violin character rather
-    than a big hall sound. Only MP3 is offered for these, since that's the
-    one people actually want out of them.
+  - Guitar Audio (MP3), Violin Audio (MP3), and Piano Audio (MP3) render the
+    piece with FluidSynth like the other audio formats, but first rewrite a
+    *copy* of the MIDI so every note plays on a single instrument instead of
+    whatever the original file specifies, and drop the GM drum channel
+    (none of these three can play a drum kit). Violin additionally uses
+    GM's "String Ensemble 2" (a.k.a. "Slow Strings") patch rather than the
+    raw solo "Violin" patch — the plain GM violin sample has a hard, plucky
+    attack that reads as harsh; Slow Strings has a much softer, slower
+    onset, closer to a gentle bowed sound. It also gets quieter velocities,
+    a FluidSynth reverb turned down further (small room, low level, chorus
+    off) so it isn't "vang" (echoey), and its own gentle lowpass + slow-
+    attack compressor pass in ffmpeg to round off any remaining harshness.
+    A dedicated soundfont for violin can be supplied via the
+    VIOLIN_SOUNDFONT_PATH env var (e.g. pointing at a real soft-solo-violin
+    .sf2) — it falls back to the shared GM soundfont if unset. Piano uses
+    the bundled soundfonts/Piano.sf2 (overridable via PIANO_SOUNDFONT_PATH)
+    and holds the sustain pedal (CC64) down for the entire piece — a CC64
+    "on" is injected at the very start of each track and any sustain
+    pedal messages already in the source file are stripped out, so the
+    pedal is never released and notes keep ringing/blending continuously
+    instead of cutting off. Only MP3 is offered for these three, since
+    that's the one people actually want out of them.
 """
 
 import asyncio
@@ -57,14 +69,30 @@ import mido
 
 MSCORE_BIN = "mscore"  # symlinked in the Docker image
 FLUIDSYNTH_BIN = "fluidsynth"
+_BASE_DIR = Path(__file__).resolve().parent
 # General MIDI soundfont installed via the `fluid-soundfont-gm` apt package
 # (see Dockerfile). Overridable in case a different soundfont is mounted.
 SOUNDFONT_PATH = os.environ.get(
     "SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2"
 )
+# Optional dedicated soundfont for the violin render (e.g. a real soft-solo-
+# violin .sf2 mounted into the container). Falls back to the shared GM
+# soundfont above when unset.
+VIOLIN_SOUNDFONT_PATH = os.environ.get("VIOLIN_SOUNDFONT_PATH", SOUNDFONT_PATH)
+# Dedicated piano soundfont bundled with the repo (soundfonts/Piano.sf2).
+# Overridable if a different piano .sf2 is mounted instead.
+PIANO_SOUNDFONT_PATH = os.environ.get(
+    "PIANO_SOUNDFONT_PATH", str(_BASE_DIR / "soundfonts" / "Piano.sf2")
+)
+
 # General MIDI program numbers (0-indexed).
-GUITAR_PROGRAM = 24  # Acoustic Guitar (steel)
-VIOLIN_PROGRAM = 40  # Violin
+GUITAR_PROGRAM = 24       # Acoustic Guitar (steel)
+VIOLIN_SOFT_PROGRAM = 49  # "String Ensemble 2" / "Slow Strings" — much
+                           # softer, slower attack than the raw solo
+                           # "Violin" patch (40), which sounds hard/plucky.
+PIANO_PROGRAM = 0         # Acoustic Grand Piano — the standard preset
+                           # (bank 0, program 0) that single-instrument
+                           # piano soundfonts are mapped to.
 
 # Formats MuseScore itself can export to directly from a single command.
 _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
@@ -72,37 +100,72 @@ _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
 _NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
 # Formats produced by re-encoding the WAV render with ffmpeg.
 _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
-# Single-instrument audio renders (MP3 only). Each entry configures how the
-# source MIDI is rewritten (instrument program, note velocity) and how
-# FluidSynth renders it (gain, extra synth options for tone/space).
-_INSTRUMENT_AUDIO_CONFIGS = {
-    "guitarmp3": {
-        "tag": "guitar",
+# ffmpeg codec args per audio container — shared between the plain audio
+# formats above and the per-instrument renders below, so e.g. "...ogg"
+# always means the same libvorbis quality everywhere.
+_AUDIO_CODEC_ARGS = {
+    "mp3": ["-codec:a", "libmp3lame", "-qscale:a", "2"],
+    "ogg": ["-codec:a", "libvorbis", "-qscale:a", "5"],
+    "wav": ["-codec:a", "pcm_s16le"],
+}
+# Single-instrument audio renders, each offered as MP3/WAV/OGG (format keys
+# "<tag>mp3" / "<tag>wav" / "<tag>ogg", e.g. "violinwav"). Each base entry
+# configures how the source MIDI is rewritten (instrument program, note
+# velocity, whether the sustain pedal is forced on), how FluidSynth renders
+# it (soundfont, gain, extra synth options for tone/space), and an optional
+# extra ffmpeg filter applied before the shared anti-clip chain (e.g. to
+# tame a bright/harsh attack).
+_INSTRUMENT_BASE_CONFIGS = {
+    "guitar": {
         "program": GUITAR_PROGRAM,
+        "soundfont": SOUNDFONT_PATH,
         "velocity_scale": 1.0,
+        "hold_sustain": False,
         "gain": 1.0,
         "fluidsynth_args": [],
+        "extra_filter": None,
     },
-    "violinmp3": {
-        "tag": "violin",
-        "program": VIOLIN_PROGRAM,
-        # Softer dynamics ("nhẹ nhàng") — scale velocities down a bit rather
-        # than passing the original (often percussion/piano-tuned) velocity
-        # curve straight through to a bowed-string patch.
-        "velocity_scale": 0.8,
+    "violin": {
+        "program": VIOLIN_SOFT_PROGRAM,
+        "soundfont": VIOLIN_SOUNDFONT_PATH,
+        # Softer attack/dynamics ("nhẹ nhàng", "nhấn quá mạnh" fix) — scale
+        # velocities down well below the original (often piano/percussion-
+        # tuned) curve.
+        "velocity_scale": 0.65,
+        "hold_sustain": False,
         # Moderate overall level ("vừa phải").
-        "gain": 0.85,
+        "gain": 0.8,
         # Small room, low reverb level, chorus off: keeps the tone present
-        # and close rather than washed out/echoey ("không quá vang").
+        # and close instead of washed out/echoey ("quá vang" fix).
         "fluidsynth_args": [
             "-o", "synth.reverb.active=1",
-            "-o", "synth.reverb.room-size=0.25",
-            "-o", "synth.reverb.damp=0.4",
-            "-o", "synth.reverb.width=0.5",
-            "-o", "synth.reverb.level=0.25",
+            "-o", "synth.reverb.room-size=0.15",
+            "-o", "synth.reverb.damp=0.5",
+            "-o", "synth.reverb.width=0.4",
+            "-o", "synth.reverb.level=0.15",
             "-o", "synth.chorus.active=0",
         ],
+        # Gentle lowpass to cut the brightest/harshest overtones, then a
+        # slow-attack compressor to round off any remaining sharp note
+        # onsets without squashing the overall performance.
+        "extra_filter": "lowpass=f=7500,acompressor=threshold=-20dB:ratio=3:attack=20:release=150",
     },
+    "piano": {
+        "program": PIANO_PROGRAM,
+        "soundfont": PIANO_SOUNDFONT_PATH,
+        "velocity_scale": 1.0,
+        # Sustain pedal held down for the whole piece — notes keep ringing
+        # and blending into each other instead of cutting off.
+        "hold_sustain": True,
+        "gain": 1.0,
+        "fluidsynth_args": [],
+        "extra_filter": None,
+    },
+}
+_INSTRUMENT_AUDIO_CONFIGS = {
+    f"{tag}{ext}": {**base, "tag": tag, "ext": ext}
+    for tag, base in _INSTRUMENT_BASE_CONFIGS.items()
+    for ext in _AUDIO_CODEC_ARGS
 }
 _INSTRUMENT_AUDIO_FORMATS = set(_INSTRUMENT_AUDIO_CONFIGS)
 # Plain-text virtual-piano / Roblox piano key sheet, and guitar tab.
@@ -397,6 +460,7 @@ def _force_instrument(
     dst: Path,
     program: int,
     velocity_scale: float = 1.0,
+    hold_sustain: bool = False,
 ) -> None:
     """Rewrite a MIDI copy so the whole piece plays on one instrument.
 
@@ -406,6 +470,12 @@ def _force_instrument(
     message is dropped, its delta time is carried forward onto the next
     kept message instead of being lost. `velocity_scale` optionally softens
     (or boosts) note-on velocities, e.g. for a gentler bowed-string feel.
+
+    When `hold_sustain` is true, any sustain-pedal (CC64) messages already
+    in the source are stripped out, and a CC64 "on" (value 127) is inserted
+    at the very start of each track instead. The pedal is then never
+    released for the rest of the piece, so notes keep ringing/blending
+    together continuously instead of cutting off.
 
     This is a best-effort instrument swap, not a real arrangement: if two
     original tracks happen to play the same pitch at once, folding them onto
@@ -420,7 +490,10 @@ def _force_instrument(
         for msg in track:
             is_drum = hasattr(msg, "channel") and msg.channel == 9
             is_program_change = msg.type == "program_change"
-            if is_drum or is_program_change:
+            is_sustain_cc = (
+                hold_sustain and msg.type == "control_change" and msg.control == 64
+            )
+            if is_drum or is_program_change or is_sustain_cc:
                 carry += msg.time
                 continue
             msg = msg.copy(time=msg.time + carry)
@@ -432,6 +505,8 @@ def _force_instrument(
                 msg = msg.copy(velocity=new_velocity)
             new_track.append(msg)
         new_track.insert(0, mido.Message("program_change", program=program, channel=0, time=0))
+        if hold_sustain:
+            new_track.insert(1, mido.Message("control_change", control=64, value=127, channel=0, time=0))
         track.clear()
         track.extend(new_track)
     mid.save(str(dst))
@@ -443,10 +518,13 @@ async def _get_instrument_midi(
     tag: str,
     program: int,
     velocity_scale: float = 1.0,
+    hold_sustain: bool = False,
 ) -> Path:
     out_path = work_dir / f"{input_midi.stem}.{tag}_instrument.mid"
     if not out_path.exists():
-        await asyncio.to_thread(_force_instrument, input_midi, out_path, program, velocity_scale)
+        await asyncio.to_thread(
+            _force_instrument, input_midi, out_path, program, velocity_scale, hold_sustain
+        )
     return out_path
 
 
@@ -464,6 +542,7 @@ async def _fluidsynth_render(
     input_midi: Path,
     out_path: Path,
     work_dir: Path,
+    soundfont: str = SOUNDFONT_PATH,
     gain: float = 1.0,
     extra_args: list[str] | None = None,
 ) -> None:
@@ -473,8 +552,9 @@ async def _fluidsynth_render(
     against a live audio device/clock, so there's nothing for the process to
     fall behind on — no dropped or duplicated audio blocks, i.e. no
     skipping/stuttering ("nhảy") in the resulting audio. This mirrors how
-    most MIDI-to-MP3 web converters render audio. `extra_args` lets callers
-    tune FluidSynth's synth options (e.g. reverb/chorus) per instrument.
+    most MIDI-to-MP3 web converters render audio. `soundfont` and
+    `extra_args` let callers use a different .sf2 / tune reverb-chorus per
+    instrument.
     """
     cmd = [
         FLUIDSYNTH_BIN,
@@ -486,7 +566,7 @@ async def _fluidsynth_render(
         cmd.extend(extra_args)
     cmd += [
         "-F", str(out_path),    # render straight to a WAV file (non-realtime)
-        SOUNDFONT_PATH,
+        soundfont,
         str(input_midi),
     ]
     await _run(cmd, cwd=work_dir, timeout=180)
@@ -533,23 +613,24 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
     if fmt in _INSTRUMENT_AUDIO_FORMATS:
         cfg = _INSTRUMENT_AUDIO_CONFIGS[fmt]
         instrument_midi = await _get_instrument_midi(
-            input_midi, work_dir, cfg["tag"], cfg["program"], cfg["velocity_scale"]
+            input_midi, work_dir, cfg["tag"], cfg["program"], cfg["velocity_scale"], cfg["hold_sustain"]
         )
         raw_wav = work_dir / f"{stem}.{cfg['tag']}.raw.wav"
         if not raw_wav.exists():
             await _fluidsynth_render(
                 instrument_midi, raw_wav, work_dir,
-                gain=cfg["gain"], extra_args=cfg["fluidsynth_args"],
+                soundfont=cfg["soundfont"], gain=cfg["gain"], extra_args=cfg["fluidsynth_args"],
             )
             if not raw_wav.exists():
                 raise ConversionError(f"FluidSynth failed to render {cfg['tag']} audio (WAV)")
 
-        out_path = work_dir / f"{stem}.{cfg['tag']}.mp3"
-        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER,
-               "-codec:a", "libmp3lame", "-qscale:a", "2", str(out_path)]
+        out_path = work_dir / f"{stem}.{cfg['tag']}.{cfg['ext']}"
+        af = f"{cfg['extra_filter']},{_ANTI_CLIP_FILTER}" if cfg.get("extra_filter") else _ANTI_CLIP_FILTER
+        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", af,
+               *_AUDIO_CODEC_ARGS[cfg["ext"]], str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
-            raise ConversionError(f"ffmpeg did not produce {cfg['tag']} MP3")
+            raise ConversionError(f"ffmpeg did not produce {cfg['tag']} {cfg['ext'].upper()}")
         return out_path
 
     if fmt in _FFMPEG_DERIVED:
@@ -562,10 +643,8 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
                 raise ConversionError("FluidSynth failed to render audio (WAV) for encoding")
 
         out_path = work_dir / f"{stem}.{fmt}"
-        codec = {"mp3": ["-codec:a", "libmp3lame", "-qscale:a", "2"],
-                 "ogg": ["-codec:a", "libvorbis", "-qscale:a", "5"],
-                 "flac": ["-codec:a", "flac"]}[fmt]
-        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER, *codec, str(out_path)]
+        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER,
+               *_AUDIO_CODEC_ARGS.get(fmt, ["-codec:a", "flac"]), str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
             raise ConversionError(f"ffmpeg did not produce {out_path.name}")
