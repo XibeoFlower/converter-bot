@@ -36,6 +36,7 @@ FORMAT_LABELS = {
     "flac": "FLAC (audio)",
     "roblox": "QWERTY Sheet (Roblox Piano)",
     "guitar": "Guitar Tab (TAB)",
+    "guitarmp3": "Guitar Audio (MP3)",
 }
 
 # Discord's *default* per-file upload cap; boosted servers get more.
