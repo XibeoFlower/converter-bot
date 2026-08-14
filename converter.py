@@ -1,28 +1,23 @@
 """
-Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3) / Violin Audio (MP3) / Piano Audio (MP3)
+Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio / Violin Audio / Piano Audio (each MP3/WAV/OGG)
 
 Strategy:
-  - MuseScore (headless, via xvfb-run) handles only notation rendering now:
+  - MuseScore (headless, via xvfb-run) handles only notation rendering:
     PDF, PNG, MusicXML, MSCZ.
-  - Audio (WAV / MP3 / OGG / FLAC) is rendered with FluidSynth instead of
-    MuseScore's own WAV export. MuseScore's headless audio export (running
-    under xvfb, no real soundcard) periodically drops or duplicates audio
-    blocks, which is heard as skipping/stuttering ("audio bị nhảy"). FluidSynth
-    renders MIDI to WAV in one non-realtime pass (no live audio device, no
-    frame drops), which is the same approach most MIDI-to-MP3 web converters
-    use, and produces smooth, glitch-free output.
+  - There's no generic "plug in any GM instrument" audio export anymore —
+    every audio output goes through one of the three named instruments
+    (Guitar / Violin / Piano) below, each rendered with FluidSynth.
+    FluidSynth renders MIDI to WAV in one non-realtime pass (no live audio
+    device, no frame drops), unlike MuseScore's headless WAV export, which
+    intermittently drops/duplicates audio blocks under xvfb (heard as
+    skipping/stuttering, "audio bị nhảy").
   - Before notation formats (PDF/PNG/MusicXML/MSCZ) and the text sheets
     (Roblox/QWERTY, Guitar Tab), we quantize a *copy* of the input MIDI to a
     16th-note grid. Raw/human-performed MIDI has timing that doesn't line up
     to any clean rhythmic grid, so reading it at tick-level precision
     produces a mess of tiny, fragmented values. Quantizing first gives clean
-    rhythms to work with. Audio and MIDI-passthrough outputs use the
-    *original*, unquantized file so the actual performance timing/feel is
-    preserved.
-  - ffmpeg converts the WAV render into MP3 / OGG / FLAC. We apply loudness
-    normalization + a peak limiter here, because summing overlapping notes
-    can exceed 0 dBFS and hard-clip (audible distortion/crackle) on dense
-    scores.
+    rhythms to work with. The instrument audio renders use the *original*,
+    unquantized file so the actual performance timing/feel is preserved.
   - MIDI output is just the original file, copied through unchanged.
   - The Roblox/QWERTY sheet maps each note to a letter on the standard
     virtual-piano keyboard layout (1234567890 / qwertyuiop / asdfghjkl /
@@ -35,28 +30,32 @@ Strategy:
     range are octave-shifted to fit, and chords with more notes than
     playable strings have the excess dropped — this is a best-effort tab,
     not a full fingering/voicing solver.
-  - Guitar Audio (MP3), Violin Audio (MP3), and Piano Audio (MP3) render the
-    piece with FluidSynth like the other audio formats, but first rewrite a
-    *copy* of the MIDI so every note plays on a single instrument instead of
-    whatever the original file specifies, and drop the GM drum channel
-    (none of these three can play a drum kit). Violin additionally uses
-    GM's "String Ensemble 2" (a.k.a. "Slow Strings") patch rather than the
-    raw solo "Violin" patch — the plain GM violin sample has a hard, plucky
-    attack that reads as harsh; Slow Strings has a much softer, slower
-    onset, closer to a gentle bowed sound. It also gets quieter velocities,
-    a FluidSynth reverb turned down further (small room, low level, chorus
-    off) so it isn't "vang" (echoey), and its own gentle lowpass + slow-
-    attack compressor pass in ffmpeg to round off any remaining harshness.
-    A dedicated soundfont for violin can be supplied via the
-    VIOLIN_SOUNDFONT_PATH env var (e.g. pointing at a real soft-solo-violin
-    .sf2) — it falls back to the shared GM soundfont if unset. Piano uses
-    the bundled soundfonts/Piano.sf2 (overridable via PIANO_SOUNDFONT_PATH)
-    and holds the sustain pedal (CC64) down for the entire piece — a CC64
-    "on" is injected at the very start of each track and any sustain
-    pedal messages already in the source file are stripped out, so the
-    pedal is never released and notes keep ringing/blending continuously
-    instead of cutting off. Only MP3 is offered for these three, since
-    that's the one people actually want out of them.
+  - Guitar Audio, Violin Audio, and Piano Audio (each offered as MP3/WAV/OGG)
+    render the piece with FluidSynth, but first rewrite a *copy* of the MIDI
+    so every note plays on a single instrument instead of whatever the
+    original file specifies, and drop the GM drum channel (none of these
+    three can play a drum kit).
+      - Violin uses GM's "String Ensemble 2" (a.k.a. "Slow Strings") patch
+        rather than the raw solo "Violin" patch — the plain GM violin
+        sample has a hard, plucky attack that reads as harsh; Slow Strings
+        has a much softer, slower onset, closer to a gentle bowed sound. It
+        also gets quieter velocities, a FluidSynth reverb turned down
+        further (small room, low level, chorus off) so it isn't "vang"
+        (echoey), and its own gentle lowpass + slow-attack compressor pass
+        in ffmpeg to round off any remaining harshness. A dedicated
+        soundfont for violin can be supplied via the VIOLIN_SOUNDFONT_PATH
+        env var — it falls back to the shared GM soundfont if unset.
+      - Piano uses the bundled soundfonts/Piano.sf2 (overridable via
+        PIANO_SOUNDFONT_PATH) and holds the sustain pedal (CC64) down for
+        the entire piece — a CC64 "on" is injected at the very start of
+        each track and any sustain pedal messages already in the source
+        file are stripped out, so the pedal is never released and notes
+        keep ringing/blending continuously instead of cutting off. This
+        particular Piano.sf2 also renders quiet at default settings, so
+        its FluidSynth gain is boosted well above the shared default and
+        its final loudness target/limiter are pushed much closer to full
+        scale than the other instruments, instead of the shared,
+        conservative broadcast-safe target.
 """
 
 import asyncio
@@ -94,15 +93,15 @@ PIANO_PROGRAM = 0         # Acoustic Grand Piano — the standard preset
                            # (bank 0, program 0) that single-instrument
                            # piano soundfonts are mapped to.
 
-# Formats MuseScore itself can export to directly from a single command.
-_MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
+# Formats MuseScore itself can export to directly from a single command
+# (only the notation ones are still exposed to users; MuseScore's own WAV
+# export is unused now — see FluidSynth note above).
+_MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz"}
 # Notation formats that benefit from quantizing the MIDI first.
 _NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
-# Formats produced by re-encoding the WAV render with ffmpeg.
-_FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
-# ffmpeg codec args per audio container — shared between the plain audio
-# formats above and the per-instrument renders below, so e.g. "...ogg"
-# always means the same libvorbis quality everywhere.
+# ffmpeg codec args per audio container — shared by every per-instrument
+# render below, so e.g. "...ogg" always means the same libvorbis quality
+# everywhere.
 _AUDIO_CODEC_ARGS = {
     "mp3": ["-codec:a", "libmp3lame", "-qscale:a", "2"],
     "ogg": ["-codec:a", "libvorbis", "-qscale:a", "5"],
@@ -157,9 +156,19 @@ _INSTRUMENT_BASE_CONFIGS = {
         # Sustain pedal held down for the whole piece — notes keep ringing
         # and blending into each other instead of cutting off.
         "hold_sustain": True,
-        "gain": 1.0,
+        # This particular Piano.sf2 renders very quiet at the default gain
+        # (1.0), so push FluidSynth's synth gain well up — the samples
+        # themselves are quiet, so there's plenty of headroom before this
+        # risks clipping at synthesis time.
+        "gain": 6.0,
         "fluidsynth_args": [],
         "extra_filter": None,
+        # ...then push the final loudness target and limiter right up
+        # against full scale ("âm lượng to nhất hết cỡ") instead of the
+        # shared, more conservative broadcast-safe target used by the other
+        # instruments. TP=-0.3 / limit=0.99 leaves just enough headroom for
+        # the limiter to catch true peaks without audible clipping.
+        "final_filter": "loudnorm=I=-7:TP=-0.3:LRA=4,alimiter=limit=0.99",
     },
 }
 _INSTRUMENT_AUDIO_CONFIGS = {
@@ -171,7 +180,7 @@ _INSTRUMENT_AUDIO_FORMATS = set(_INSTRUMENT_AUDIO_CONFIGS)
 # Plain-text virtual-piano / Roblox piano key sheet, and guitar tab.
 _TEXT_FORMATS = {"roblox", "guitar"}
 
-SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | _INSTRUMENT_AUDIO_FORMATS | {"midi"}
+SUPPORTED_FORMATS = _NOTATION_FORMATS | _TEXT_FORMATS | _INSTRUMENT_AUDIO_FORMATS | {"midi"}
 
 # Audio filter: loudnorm brings overall level to a safe target *before* any
 # clipping happens, alimiter catches remaining peaks. This fixes crackle/
@@ -555,7 +564,15 @@ async def _fluidsynth_render(
     most MIDI-to-MP3 web converters render audio. `soundfont` and
     `extra_args` let callers use a different .sf2 / tune reverb-chorus per
     instrument.
+
+    `soundfont` is passed to FluidSynth as an explicit file path — FluidSynth
+    has no notion of a "default" soundfont to silently fall back to, so
+    whatever file is given here is exactly what gets used. We still check it
+    exists first so a missing/misconfigured soundfont fails with a clear
+    error instead of a cryptic FluidSynth crash.
     """
+    if not Path(soundfont).is_file():
+        raise ConversionError(f"Soundfont not found: {soundfont}")
     cmd = [
         FLUIDSYNTH_BIN,
         "-ni",                  # no interactive shell, no MIDI input device
@@ -597,19 +614,6 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
             raise ConversionError(f"MuseScore did not produce {out_path.name}")
         return out_path
 
-    if fmt == "wav":
-        out_path = work_dir / f"{stem}.wav"
-        raw_wav = work_dir / f"{stem}.raw.wav"
-        if not raw_wav.exists():
-            await _fluidsynth_render(input_midi, raw_wav, work_dir)
-            if not raw_wav.exists():
-                raise ConversionError("FluidSynth failed to render audio (WAV)")
-        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER, str(out_path)]
-        await _run(cmd, cwd=work_dir)
-        if not out_path.exists():
-            raise ConversionError("ffmpeg did not produce anti-clip WAV")
-        return out_path
-
     if fmt in _INSTRUMENT_AUDIO_FORMATS:
         cfg = _INSTRUMENT_AUDIO_CONFIGS[fmt]
         instrument_midi = await _get_instrument_midi(
@@ -625,29 +629,13 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
                 raise ConversionError(f"FluidSynth failed to render {cfg['tag']} audio (WAV)")
 
         out_path = work_dir / f"{stem}.{cfg['tag']}.{cfg['ext']}"
-        af = f"{cfg['extra_filter']},{_ANTI_CLIP_FILTER}" if cfg.get("extra_filter") else _ANTI_CLIP_FILTER
+        final_filter = cfg.get("final_filter") or _ANTI_CLIP_FILTER
+        af = f"{cfg['extra_filter']},{final_filter}" if cfg.get("extra_filter") else final_filter
         cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", af,
                *_AUDIO_CODEC_ARGS[cfg["ext"]], str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
             raise ConversionError(f"ffmpeg did not produce {cfg['tag']} {cfg['ext'].upper()}")
-        return out_path
-
-    if fmt in _FFMPEG_DERIVED:
-        # Render raw WAV first (cached per work_dir), then re-encode with the
-        # anti-clip filter applied.
-        raw_wav = work_dir / f"{stem}.raw.wav"
-        if not raw_wav.exists():
-            await _fluidsynth_render(input_midi, raw_wav, work_dir)
-            if not raw_wav.exists():
-                raise ConversionError("FluidSynth failed to render audio (WAV) for encoding")
-
-        out_path = work_dir / f"{stem}.{fmt}"
-        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER,
-               *_AUDIO_CODEC_ARGS.get(fmt, ["-codec:a", "flac"]), str(out_path)]
-        await _run(cmd, cwd=work_dir)
-        if not out_path.exists():
-            raise ConversionError(f"ffmpeg did not produce {out_path.name}")
         return out_path
 
     raise ConversionError(f"Unhandled format: {fmt}")
