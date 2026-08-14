@@ -37,7 +37,14 @@ FORMAT_LABELS = {
     "roblox": "QWERTY Sheet (Roblox Piano)",
     "guitar": "Guitar Tab (TAB)",
     "guitarmp3": "Guitar Audio (MP3)",
+    "guitarwav": "Guitar Audio (WAV)",
+    "guitarogg": "Guitar Audio (OGG)",
     "violinmp3": "Violin Audio (MP3)",
+    "violinwav": "Violin Audio (WAV)",
+    "violinogg": "Violin Audio (OGG)",
+    "pianomp3": "Piano Audio (MP3)",
+    "pianowav": "Piano Audio (WAV)",
+    "pianoogg": "Piano Audio (OGG)",
 }
 
 # Discord's *default* per-file upload cap; boosted servers get more.
