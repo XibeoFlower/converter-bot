@@ -52,4 +52,12 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Fail the build loudly (not a silent runtime error deep in a Discord
+# interaction) if the bundled piano soundfont wasn't committed/copied in —
+# it must sit at soundfonts/Piano.sf2, right next to this Dockerfile.
+RUN test -f soundfonts/Piano.sf2 || \
+    (echo "ERROR: soundfonts/Piano.sf2 is missing from the build context." \
+          "Make sure that file is committed to the repo at the same level" \
+          "as this Dockerfile before deploying." && exit 1)
+
 CMD ["python3", "bot.py"]
