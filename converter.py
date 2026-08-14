@@ -1,5 +1,5 @@
 """
-Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet
+Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab
 
 Strategy:
   - MuseScore (headless, via xvfb-run) handles only notation rendering now:
@@ -11,13 +11,14 @@ Strategy:
     renders MIDI to WAV in one non-realtime pass (no live audio device, no
     frame drops), which is the same approach most MIDI-to-MP3 web converters
     use, and produces smooth, glitch-free output.
-  - Before notation formats (PDF/PNG/MusicXML/MSCZ) and the Roblox/QWERTY
-    text sheet, we quantize a *copy* of the input MIDI to a 16th-note grid.
-    Raw/human-performed MIDI has timing that doesn't line up to any clean
-    rhythmic grid, so reading it at tick-level precision produces a mess of
-    tiny, fragmented values. Quantizing first gives clean rhythms to work
-    with. Audio and MIDI-passthrough outputs use the *original*, unquantized
-    file so the actual performance timing/feel is preserved.
+  - Before notation formats (PDF/PNG/MusicXML/MSCZ) and the text sheets
+    (Roblox/QWERTY, Guitar Tab), we quantize a *copy* of the input MIDI to a
+    16th-note grid. Raw/human-performed MIDI has timing that doesn't line up
+    to any clean rhythmic grid, so reading it at tick-level precision
+    produces a mess of tiny, fragmented values. Quantizing first gives clean
+    rhythms to work with. Audio and MIDI-passthrough outputs use the
+    *original*, unquantized file so the actual performance timing/feel is
+    preserved.
   - ffmpeg converts the WAV render into MP3 / OGG / FLAC. We apply loudness
     normalization + a peak limiter here, because summing overlapping notes
     can exceed 0 dBFS and hard-clip (audible distortion/crackle) on dense
@@ -28,6 +29,12 @@ Strategy:
     zxcvbnm, covering C2–C7). Sharps/flats are rounded to the nearest
     natural key since that layout only exposes white keys directly.
     Simultaneous notes are grouped as a bracketed chord, e.g. [sdf].
+  - The Guitar Tab sheet maps notes onto standard-tuned guitar strings
+    (EADGBE) as fret numbers, greedily assigning each simultaneous note to
+    the lowest free string that can reach it. Notes outside the guitar's
+    range are octave-shifted to fit, and chords with more notes than
+    playable strings have the excess dropped — this is a best-effort tab,
+    not a full fingering/voicing solver.
 """
 
 import asyncio
@@ -52,8 +59,8 @@ _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
 _NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
 # Formats produced by re-encoding the WAV render with ffmpeg.
 _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
-# Plain-text virtual-piano / Roblox piano key sheet.
-_TEXT_FORMATS = {"roblox"}
+# Plain-text virtual-piano / Roblox piano key sheet, and guitar tab.
+_TEXT_FORMATS = {"roblox", "guitar"}
 
 SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | {"midi"}
 
@@ -82,6 +89,13 @@ def _build_roblox_key_table() -> list[tuple[str, int]]:
 _ROBLOX_KEY_TABLE = _build_roblox_key_table()
 _ROBLOX_MIN_NOTE = _ROBLOX_KEY_TABLE[0][1]
 _ROBLOX_MAX_NOTE = _ROBLOX_KEY_TABLE[-1][1]
+
+# Standard guitar tuning, low string to high string: E2 A2 D3 G3 B3 E4.
+_GUITAR_STRINGS = [40, 45, 50, 55, 59, 64]  # open-string MIDI note numbers
+_GUITAR_STRING_LABELS = ["E", "A", "D", "G", "B", "e"]  # low -> high (tab convention: 'e' = high E)
+_GUITAR_MAX_FRET = 19
+_GUITAR_MIN_NOTE = _GUITAR_STRINGS[0]
+_GUITAR_MAX_NOTE = _GUITAR_STRINGS[-1] + _GUITAR_MAX_FRET
 
 log = logging.getLogger("converter")
 
@@ -234,6 +248,104 @@ async def _get_roblox_sheet(input_midi: Path, work_dir: Path) -> Path:
     return out_path
 
 
+def _fit_guitar_range(note: int) -> int:
+    # Octave-shift into the guitar's playable range [E2, E4+max_fret], the
+    # same trick used for the Roblox layout — keeps the note but moves it
+    # into reach instead of dropping it.
+    while note < _GUITAR_MIN_NOTE:
+        note += 12
+    while note > _GUITAR_MAX_NOTE:
+        note -= 12
+    return note
+
+
+def _assign_frets(notes: list[int]) -> dict[int, int]:
+    """Greedily assign one chord/group of simultaneous notes to strings.
+
+    Returns {string_index: fret}, where string_index 0 = low E, 5 = high e.
+    Lowest notes are assigned first; each note goes to the free string that
+    reaches it with the lowest fret (falling back to the lower string on
+    ties) — this keeps the shape closer to how a guitarist would actually
+    finger it, favoring open strings and low positions over high ones. A
+    note that can't fit on any free string (e.g. a dense chord with more
+    notes than open strings) is dropped; this is a best-effort tab, not a
+    full voicing solver.
+    """
+    assignment: dict[int, int] = {}
+    used_strings: set[int] = set()
+    for note in sorted(set(_fit_guitar_range(n) for n in notes)):
+        candidates = [
+            (s_idx, note - open_note)
+            for s_idx, open_note in enumerate(_GUITAR_STRINGS)
+            if s_idx not in used_strings and 0 <= note - open_note <= _GUITAR_MAX_FRET
+        ]
+        if not candidates:
+            continue  # no free string can reach this note — drop it
+        s_idx, fret = min(candidates, key=lambda pair: (pair[1], pair[0]))
+        assignment[s_idx] = fret
+        used_strings.add(s_idx)
+    return assignment
+
+
+def _midi_to_guitar_tab(src: Path, dst: Path, subdivision: int = 16) -> None:
+    mid = mido.MidiFile(str(src))
+    ticks_per_beat = mid.ticks_per_beat
+    grid = max(1, round(ticks_per_beat * 4 / subdivision))
+
+    merged = mido.merge_tracks(mid.tracks)
+    abs_time = 0
+    notes_at_tick: dict[int, list[int]] = {}
+    for msg in merged:
+        abs_time += msg.time
+        if msg.type == "note_on" and msg.velocity > 0:
+            if getattr(msg, "channel", 0) == 9:
+                continue  # skip GM drum channel — not meaningful on a guitar tab
+            q_tick = round(abs_time / grid) * grid
+            notes_at_tick.setdefault(q_tick, []).append(msg.note)
+
+    if not notes_at_tick:
+        dst.write_text("# Không tìm thấy nốt nhạc nào trong file MIDI này.\n")
+        return
+
+    # One column per grid step that actually has notes (silent grid steps
+    # are skipped entirely to keep the tab compact/readable).
+    columns = [_assign_frets(notes_at_tick[tick]) for tick in sorted(notes_at_tick)]
+
+    cells_by_string: dict[int, list[str]] = {i: [] for i in range(6)}
+    for col in columns:
+        for s_idx in range(6):
+            fret = col.get(s_idx)
+            cell = f"{fret:<2}" if fret is not None else "--"
+            cells_by_string[s_idx].append(cell + "-")
+
+    lines = [
+        "# Guitar Tab — tự động tạo từ MIDI (tuning chuẩn EADGBE).",
+        "# Số = phím (fret) cần bấm, '-' = không bấm dây đó lúc này.",
+        "# Bản tab gần đúng: nốt ngoài tầm đàn được chuyển quãng 8 cho vừa,",
+        "# hợp âm quá dày (nhiều nốt hơn số dây) có thể bị bỏ bớt nốt.",
+        "",
+    ]
+    chunk = 24  # events per line block, so lines wrap to a readable width
+    total = len(columns)
+    for start in range(0, total, chunk):
+        end = min(start + chunk, total)
+        for s_idx in range(5, -1, -1):
+            row = "".join(cells_by_string[s_idx][start:end])
+            lines.append(f"{_GUITAR_STRING_LABELS[s_idx]}|{row}|")
+        lines.append("")
+
+    dst.write_text("\n".join(lines).rstrip() + "\n")
+
+
+async def _get_guitar_tab(input_midi: Path, work_dir: Path) -> Path:
+    source = await _get_quantized_midi(input_midi, work_dir)
+    out_path = work_dir / f"{input_midi.stem}.guitar.txt"
+    await asyncio.to_thread(_midi_to_guitar_tab, source, out_path)
+    if not out_path.exists():
+        raise ConversionError("Không tạo được Guitar Tab")
+    return out_path
+
+
 async def _mscore_export(input_midi: Path, out_path: Path, work_dir: Path) -> None:
     cmd = [
         "xvfb-run", "-a",
@@ -279,7 +391,8 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
         return out_path
 
     if fmt in _TEXT_FORMATS:
-        return await _get_roblox_sheet(input_midi, work_dir)
+        return await _get_guitar_tab(input_midi, work_dir) if fmt == "guitar" \
+            else await _get_roblox_sheet(input_midi, work_dir)
 
     if fmt in _NOTATION_FORMATS:
         source = await _get_quantized_midi(input_midi, work_dir)
