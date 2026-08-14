@@ -30,10 +30,6 @@ FORMAT_LABELS = {
     "musicxml": "MusicXML",
     "mscz": "MSCZ (MuseScore file)",
     "midi": "MIDI (original)",
-    "wav": "WAV (audio)",
-    "mp3": "MP3 (audio)",
-    "ogg": "OGG (audio)",
-    "flac": "FLAC (audio)",
     "roblox": "QWERTY Sheet (Roblox Piano)",
     "guitar": "Guitar Tab (TAB)",
     "guitarmp3": "Guitar Audio (MP3)",
@@ -145,7 +141,7 @@ async def on_ready():
     log.info("Logged in as %s", bot.user)
 
 
-@bot.tree.command(name="converter", description="Chuyển đổi file MIDI sang PDF/PNG/MP3/WAV/FLAC/OGG/MusicXML/MSCZ/Guitar Tab")
+@bot.tree.command(name="converter", description="Chuyển đổi file MIDI sang PDF/PNG/MusicXML/MSCZ/Guitar Tab/Guitar-Violin-Piano Audio")
 @app_commands.describe(file="File MIDI cần chuyển đổi (.mid / .midi)")
 async def converter(interaction: discord.Interaction, file: discord.Attachment):
     if not file.filename.lower().endswith((".mid", ".midi")):
