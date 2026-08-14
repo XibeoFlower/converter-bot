@@ -1,5 +1,5 @@
 """
-Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3)
+Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3) / Violin Audio (MP3)
 
 Strategy:
   - MuseScore (headless, via xvfb-run) handles only notation rendering now:
@@ -35,12 +35,16 @@ Strategy:
     range are octave-shifted to fit, and chords with more notes than
     playable strings have the excess dropped — this is a best-effort tab,
     not a full fingering/voicing solver.
-  - Guitar Audio (MP3) renders the piece with FluidSynth like the other
-    audio formats, but first rewrites a *copy* of the MIDI so every note
-    plays on a single Acoustic Guitar (steel) instrument instead of
-    whatever instruments the original file specifies, and drops the GM
-    drum channel (a guitar can't play a drum kit). Only MP3 is offered for
-    this format, since that's the one people actually want out of it.
+  - Guitar Audio (MP3) and Violin Audio (MP3) render the piece with
+    FluidSynth like the other audio formats, but first rewrite a *copy* of
+    the MIDI so every note plays on a single instrument (Acoustic Guitar
+    (steel), or Violin) instead of whatever the original file specifies,
+    and drop the GM drum channel (neither instrument can play a drum kit).
+    Violin also gets gentler per-note velocities and a FluidSynth reverb
+    tuned down (small room, low level, chorus off) so it stays moderate and
+    not "vang" (echoey) — a soft, close-mic'd solo-violin character rather
+    than a big hall sound. Only MP3 is offered for these, since that's the
+    one people actually want out of them.
 """
 
 import asyncio
@@ -58,8 +62,9 @@ FLUIDSYNTH_BIN = "fluidsynth"
 SOUNDFONT_PATH = os.environ.get(
     "SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2"
 )
-# General MIDI program number (0-indexed) for "Acoustic Guitar (steel)".
-GUITAR_PROGRAM = 24
+# General MIDI program numbers (0-indexed).
+GUITAR_PROGRAM = 24  # Acoustic Guitar (steel)
+VIOLIN_PROGRAM = 40  # Violin
 
 # Formats MuseScore itself can export to directly from a single command.
 _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
@@ -67,12 +72,43 @@ _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
 _NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
 # Formats produced by re-encoding the WAV render with ffmpeg.
 _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
-# Guitar-instrument audio render (single format: MP3 only).
-_GUITAR_AUDIO_FORMATS = {"guitarmp3"}
+# Single-instrument audio renders (MP3 only). Each entry configures how the
+# source MIDI is rewritten (instrument program, note velocity) and how
+# FluidSynth renders it (gain, extra synth options for tone/space).
+_INSTRUMENT_AUDIO_CONFIGS = {
+    "guitarmp3": {
+        "tag": "guitar",
+        "program": GUITAR_PROGRAM,
+        "velocity_scale": 1.0,
+        "gain": 1.0,
+        "fluidsynth_args": [],
+    },
+    "violinmp3": {
+        "tag": "violin",
+        "program": VIOLIN_PROGRAM,
+        # Softer dynamics ("nhẹ nhàng") — scale velocities down a bit rather
+        # than passing the original (often percussion/piano-tuned) velocity
+        # curve straight through to a bowed-string patch.
+        "velocity_scale": 0.8,
+        # Moderate overall level ("vừa phải").
+        "gain": 0.85,
+        # Small room, low reverb level, chorus off: keeps the tone present
+        # and close rather than washed out/echoey ("không quá vang").
+        "fluidsynth_args": [
+            "-o", "synth.reverb.active=1",
+            "-o", "synth.reverb.room-size=0.25",
+            "-o", "synth.reverb.damp=0.4",
+            "-o", "synth.reverb.width=0.5",
+            "-o", "synth.reverb.level=0.25",
+            "-o", "synth.chorus.active=0",
+        ],
+    },
+}
+_INSTRUMENT_AUDIO_FORMATS = set(_INSTRUMENT_AUDIO_CONFIGS)
 # Plain-text virtual-piano / Roblox piano key sheet, and guitar tab.
 _TEXT_FORMATS = {"roblox", "guitar"}
 
-SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | _GUITAR_AUDIO_FORMATS | {"midi"}
+SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | _INSTRUMENT_AUDIO_FORMATS | {"midi"}
 
 # Audio filter: loudnorm brings overall level to a safe target *before* any
 # clipping happens, alimiter catches remaining peaks. This fixes crackle/
@@ -356,14 +392,20 @@ async def _get_guitar_tab(input_midi: Path, work_dir: Path) -> Path:
     return out_path
 
 
-def _force_guitar_instrument(src: Path, dst: Path, program: int = GUITAR_PROGRAM) -> None:
-    """Rewrite a MIDI copy so the whole piece plays on one guitar instrument.
+def _force_instrument(
+    src: Path,
+    dst: Path,
+    program: int,
+    velocity_scale: float = 1.0,
+) -> None:
+    """Rewrite a MIDI copy so the whole piece plays on one instrument.
 
     Every note-carrying message is moved onto channel 0 with `program`
-    forced (default: Acoustic Guitar (steel)); the GM drum channel (9) is
-    dropped entirely since a guitar can't play a drum kit. Timing is
-    preserved exactly — when a message is dropped, its delta time is
-    carried forward onto the next kept message instead of being lost.
+    forced; the GM drum channel (9) is dropped entirely since a melodic
+    instrument can't play a drum kit. Timing is preserved exactly — when a
+    message is dropped, its delta time is carried forward onto the next
+    kept message instead of being lost. `velocity_scale` optionally softens
+    (or boosts) note-on velocities, e.g. for a gentler bowed-string feel.
 
     This is a best-effort instrument swap, not a real arrangement: if two
     original tracks happen to play the same pitch at once, folding them onto
@@ -385,6 +427,9 @@ def _force_guitar_instrument(src: Path, dst: Path, program: int = GUITAR_PROGRAM
             carry = 0
             if hasattr(msg, "channel"):
                 msg = msg.copy(channel=0)
+            if msg.type == "note_on" and msg.velocity > 0 and velocity_scale != 1.0:
+                new_velocity = max(1, min(127, round(msg.velocity * velocity_scale)))
+                msg = msg.copy(velocity=new_velocity)
             new_track.append(msg)
         new_track.insert(0, mido.Message("program_change", program=program, channel=0, time=0))
         track.clear()
@@ -392,10 +437,16 @@ def _force_guitar_instrument(src: Path, dst: Path, program: int = GUITAR_PROGRAM
     mid.save(str(dst))
 
 
-async def _get_guitar_instrument_midi(input_midi: Path, work_dir: Path) -> Path:
-    out_path = work_dir / f"{input_midi.stem}.guitar_instrument.mid"
+async def _get_instrument_midi(
+    input_midi: Path,
+    work_dir: Path,
+    tag: str,
+    program: int,
+    velocity_scale: float = 1.0,
+) -> Path:
+    out_path = work_dir / f"{input_midi.stem}.{tag}_instrument.mid"
     if not out_path.exists():
-        await asyncio.to_thread(_force_guitar_instrument, input_midi, out_path)
+        await asyncio.to_thread(_force_instrument, input_midi, out_path, program, velocity_scale)
     return out_path
 
 
@@ -409,20 +460,31 @@ async def _mscore_export(input_midi: Path, out_path: Path, work_dir: Path) -> No
     await _run(cmd, cwd=work_dir)
 
 
-async def _fluidsynth_render(input_midi: Path, out_path: Path, work_dir: Path) -> None:
+async def _fluidsynth_render(
+    input_midi: Path,
+    out_path: Path,
+    work_dir: Path,
+    gain: float = 1.0,
+    extra_args: list[str] | None = None,
+) -> None:
     """Render MIDI to WAV with FluidSynth in one non-realtime pass.
 
     Unlike MuseScore's headless (xvfb) audio export, this doesn't render
     against a live audio device/clock, so there's nothing for the process to
     fall behind on — no dropped or duplicated audio blocks, i.e. no
     skipping/stuttering ("nhảy") in the resulting audio. This mirrors how
-    most MIDI-to-MP3 web converters render audio.
+    most MIDI-to-MP3 web converters render audio. `extra_args` lets callers
+    tune FluidSynth's synth options (e.g. reverb/chorus) per instrument.
     """
     cmd = [
         FLUIDSYNTH_BIN,
         "-ni",                  # no interactive shell, no MIDI input device
-        "-g", "1.0",            # synth gain
+        "-g", str(gain),        # synth gain
         "-r", "44100",          # sample rate
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd += [
         "-F", str(out_path),    # render straight to a WAV file (non-realtime)
         SOUNDFONT_PATH,
         str(input_midi),
@@ -468,20 +530,26 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
             raise ConversionError("ffmpeg did not produce anti-clip WAV")
         return out_path
 
-    if fmt in _GUITAR_AUDIO_FORMATS:
-        guitar_midi = await _get_guitar_instrument_midi(input_midi, work_dir)
-        raw_wav = work_dir / f"{stem}.guitar.raw.wav"
+    if fmt in _INSTRUMENT_AUDIO_FORMATS:
+        cfg = _INSTRUMENT_AUDIO_CONFIGS[fmt]
+        instrument_midi = await _get_instrument_midi(
+            input_midi, work_dir, cfg["tag"], cfg["program"], cfg["velocity_scale"]
+        )
+        raw_wav = work_dir / f"{stem}.{cfg['tag']}.raw.wav"
         if not raw_wav.exists():
-            await _fluidsynth_render(guitar_midi, raw_wav, work_dir)
+            await _fluidsynth_render(
+                instrument_midi, raw_wav, work_dir,
+                gain=cfg["gain"], extra_args=cfg["fluidsynth_args"],
+            )
             if not raw_wav.exists():
-                raise ConversionError("FluidSynth failed to render guitar audio (WAV)")
+                raise ConversionError(f"FluidSynth failed to render {cfg['tag']} audio (WAV)")
 
-        out_path = work_dir / f"{stem}.guitar.mp3"
+        out_path = work_dir / f"{stem}.{cfg['tag']}.mp3"
         cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER,
                "-codec:a", "libmp3lame", "-qscale:a", "2", str(out_path)]
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
-            raise ConversionError("ffmpeg did not produce guitar MP3")
+            raise ConversionError(f"ffmpeg did not produce {cfg['tag']} MP3")
         return out_path
 
     if fmt in _FFMPEG_DERIVED:
