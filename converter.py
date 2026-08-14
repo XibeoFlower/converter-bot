@@ -1,5 +1,5 @@
 """
-Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab
+Conversion helpers: MIDI -> PDF / PNG / MusicXML / MSCZ / WAV / MP3 / OGG / FLAC / MIDI / Roblox QWERTY sheet / Guitar Tab / Guitar Audio (MP3)
 
 Strategy:
   - MuseScore (headless, via xvfb-run) handles only notation rendering now:
@@ -35,6 +35,12 @@ Strategy:
     range are octave-shifted to fit, and chords with more notes than
     playable strings have the excess dropped — this is a best-effort tab,
     not a full fingering/voicing solver.
+  - Guitar Audio (MP3) renders the piece with FluidSynth like the other
+    audio formats, but first rewrites a *copy* of the MIDI so every note
+    plays on a single Acoustic Guitar (steel) instrument instead of
+    whatever instruments the original file specifies, and drops the GM
+    drum channel (a guitar can't play a drum kit). Only MP3 is offered for
+    this format, since that's the one people actually want out of it.
 """
 
 import asyncio
@@ -52,6 +58,8 @@ FLUIDSYNTH_BIN = "fluidsynth"
 SOUNDFONT_PATH = os.environ.get(
     "SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2"
 )
+# General MIDI program number (0-indexed) for "Acoustic Guitar (steel)".
+GUITAR_PROGRAM = 24
 
 # Formats MuseScore itself can export to directly from a single command.
 _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
@@ -59,10 +67,12 @@ _MSCORE_NATIVE = {"pdf", "png", "musicxml", "mscz", "wav"}
 _NOTATION_FORMATS = {"pdf", "png", "musicxml", "mscz"}
 # Formats produced by re-encoding the WAV render with ffmpeg.
 _FFMPEG_DERIVED = {"mp3", "ogg", "flac"}
+# Guitar-instrument audio render (single format: MP3 only).
+_GUITAR_AUDIO_FORMATS = {"guitarmp3"}
 # Plain-text virtual-piano / Roblox piano key sheet, and guitar tab.
 _TEXT_FORMATS = {"roblox", "guitar"}
 
-SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | {"midi"}
+SUPPORTED_FORMATS = _MSCORE_NATIVE | _FFMPEG_DERIVED | _TEXT_FORMATS | _GUITAR_AUDIO_FORMATS | {"midi"}
 
 # Audio filter: loudnorm brings overall level to a safe target *before* any
 # clipping happens, alimiter catches remaining peaks. This fixes crackle/
@@ -346,6 +356,49 @@ async def _get_guitar_tab(input_midi: Path, work_dir: Path) -> Path:
     return out_path
 
 
+def _force_guitar_instrument(src: Path, dst: Path, program: int = GUITAR_PROGRAM) -> None:
+    """Rewrite a MIDI copy so the whole piece plays on one guitar instrument.
+
+    Every note-carrying message is moved onto channel 0 with `program`
+    forced (default: Acoustic Guitar (steel)); the GM drum channel (9) is
+    dropped entirely since a guitar can't play a drum kit. Timing is
+    preserved exactly — when a message is dropped, its delta time is
+    carried forward onto the next kept message instead of being lost.
+
+    This is a best-effort instrument swap, not a real arrangement: if two
+    original tracks happen to play the same pitch at once, folding them onto
+    one channel means one note-off can end both notes early. For most MIDI
+    files (single melodic line, or non-overlapping parts) this isn't
+    noticeable.
+    """
+    mid = mido.MidiFile(str(src))
+    for track in mid.tracks:
+        new_track = mido.MidiTrack()
+        carry = 0
+        for msg in track:
+            is_drum = hasattr(msg, "channel") and msg.channel == 9
+            is_program_change = msg.type == "program_change"
+            if is_drum or is_program_change:
+                carry += msg.time
+                continue
+            msg = msg.copy(time=msg.time + carry)
+            carry = 0
+            if hasattr(msg, "channel"):
+                msg = msg.copy(channel=0)
+            new_track.append(msg)
+        new_track.insert(0, mido.Message("program_change", program=program, channel=0, time=0))
+        track.clear()
+        track.extend(new_track)
+    mid.save(str(dst))
+
+
+async def _get_guitar_instrument_midi(input_midi: Path, work_dir: Path) -> Path:
+    out_path = work_dir / f"{input_midi.stem}.guitar_instrument.mid"
+    if not out_path.exists():
+        await asyncio.to_thread(_force_guitar_instrument, input_midi, out_path)
+    return out_path
+
+
 async def _mscore_export(input_midi: Path, out_path: Path, work_dir: Path) -> None:
     cmd = [
         "xvfb-run", "-a",
@@ -413,6 +466,22 @@ async def convert_one(input_midi: Path, fmt: str, work_dir: Path) -> Path:
         await _run(cmd, cwd=work_dir)
         if not out_path.exists():
             raise ConversionError("ffmpeg did not produce anti-clip WAV")
+        return out_path
+
+    if fmt in _GUITAR_AUDIO_FORMATS:
+        guitar_midi = await _get_guitar_instrument_midi(input_midi, work_dir)
+        raw_wav = work_dir / f"{stem}.guitar.raw.wav"
+        if not raw_wav.exists():
+            await _fluidsynth_render(guitar_midi, raw_wav, work_dir)
+            if not raw_wav.exists():
+                raise ConversionError("FluidSynth failed to render guitar audio (WAV)")
+
+        out_path = work_dir / f"{stem}.guitar.mp3"
+        cmd = ["ffmpeg", "-y", "-i", str(raw_wav), "-af", _ANTI_CLIP_FILTER,
+               "-codec:a", "libmp3lame", "-qscale:a", "2", str(out_path)]
+        await _run(cmd, cwd=work_dir)
+        if not out_path.exists():
+            raise ConversionError("ffmpeg did not produce guitar MP3")
         return out_path
 
     if fmt in _FFMPEG_DERIVED:
