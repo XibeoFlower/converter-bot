@@ -45,9 +45,9 @@ Strategy:
         in ffmpeg to round off any remaining harshness. A dedicated
         soundfont for violin can be supplied via the VIOLIN_SOUNDFONT_PATH
         env var — it falls back to the shared GM soundfont if unset.
-      - Piano uses the bundled soundfonts/Piano.sf2 (overridable via
-        PIANO_SOUNDFONT_PATH) and holds the sustain pedal (CC64) down for
-        the entire piece — a CC64 "on" is injected at the very start of
+      - Piano uses the bundled Piano.sf2 (sitting at the repo root, next to
+        this file; overridable via PIANO_SOUNDFONT_PATH) and holds the
+        sustain pedal (CC64) down for the entire piece — a CC64 "on" is injected at the very start of
         each track and any sustain pedal messages already in the source
         file are stripped out, so the pedal is never released and notes
         keep ringing/blending continuously instead of cutting off. This
@@ -78,10 +78,11 @@ SOUNDFONT_PATH = os.environ.get(
 # violin .sf2 mounted into the container). Falls back to the shared GM
 # soundfont above when unset.
 VIOLIN_SOUNDFONT_PATH = os.environ.get("VIOLIN_SOUNDFONT_PATH", SOUNDFONT_PATH)
-# Dedicated piano soundfont bundled with the repo (soundfonts/Piano.sf2).
-# Overridable if a different piano .sf2 is mounted instead.
+# Dedicated piano soundfont bundled with the repo, sitting right next to
+# this file (repo root: Piano.sf2). Overridable if a different piano .sf2
+# is mounted instead.
 PIANO_SOUNDFONT_PATH = os.environ.get(
-    "PIANO_SOUNDFONT_PATH", str(_BASE_DIR / "soundfonts" / "Piano.sf2")
+    "PIANO_SOUNDFONT_PATH", str(_BASE_DIR / "Piano.sf2")
 )
 
 # General MIDI program numbers (0-indexed).
