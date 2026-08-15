@@ -1,3 +1,63 @@
-discord.py>=2.4.0
-python-dotenv>=1.0.0
-mido>=1.3.0
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    MSCORE_BIN=/opt/musescore/bin/mscore4portable
+
+# --- System deps -----------------------------------------------------------
+# We install the `musescore` apt package purely to pull in its full runtime
+# dependency graph (OpenGL, audio, X11, font libs, etc. — MuseScore 4's
+# AppImage is picky and under-documents what it actually needs). We then
+# remove just the `musescore` binary package afterwards and run the newer
+# MuseScore 4 AppImage instead, keeping all the transitively-installed libs.
+# fluidsynth + fluid-soundfont-gm render the audio outputs (WAV/MP3/OGG/FLAC)
+# in one non-realtime pass, instead of MuseScore's headless WAV export —
+# that path intermittently drops/duplicates audio blocks under xvfb (heard as
+# skipping/stuttering). MuseScore is kept only for notation exports
+# (PDF/PNG/MusicXML/MSCZ).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
+        wget \
+        ca-certificates \
+        musescore \
+        libnss3 \
+        libxkbcommon0 \
+        libegl1 \
+        libopengl0 \
+        libgl1 \
+        fontconfig \
+        fonts-freefont-ttf \
+        ffmpeg \
+        fluidsynth \
+        fluid-soundfont-gm \
+        python3 \
+        python3-pip \
+    && apt-get remove -y musescore \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- MuseScore 4 (AppImage, extracted so it runs without FUSE) ----------
+RUN wget -q -O /tmp/musescore.appimage \
+        https://cdn.jsdelivr.net/musescore/v4.4.1/MuseScore-Studio-4.4.1.242490810-x86_64.AppImage \
+    && chmod +x /tmp/musescore.appimage \
+    && mkdir -p /opt/musescore \
+    && cd /opt/musescore \
+    && /tmp/musescore.appimage --appimage-extract >/dev/null \
+    && cp -a squashfs-root/. . \
+    && rm -rf squashfs-root \
+    && rm /tmp/musescore.appimage \
+    && ln -s /opt/musescore/bin/mscore4portable /usr/local/bin/mscore
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Fail the build loudly (not a silent runtime error deep in a Discord
+# interaction) if the bundled piano soundfont wasn't committed/copied in —
+# it must sit at Piano.sf2, right next to this Dockerfile (repo root).
+RUN test -f Piano.sf2 || \
+    (echo "ERROR: Piano.sf2 is missing from the build context." \
+          "Make sure that file is committed to the repo at the same level" \
+          "as this Dockerfile before deploying." && exit 1)
+
+CMD ["python3", "bot.py"]
